@@ -21,6 +21,14 @@ from ..optim.lr_scheduler import FlatCosineLRScheduler
 
 class DetSolver(BaseSolver):
 
+    def _setup(self):
+        super()._setup()
+        teacher_model = self.cfg.teacher_model
+        
+        self.teacher_model = self.to(teacher_model, self.device)
+        if self.teacher_model is not None:
+             self.teacher_model.eval()
+
     def fit(self, ):
         self.train()
         args = self.cfg
@@ -80,7 +88,7 @@ class DetSolver(BaseSolver):
                 self.ema.decay = self.train_dataloader.collate_fn.ema_restart_decay
                 print(f'Refresh EMA at epoch {epoch} with decay {self.ema.decay}')
 
-            train_stats = train_one_epoch(
+            train_stats, grad_percentages = train_one_epoch(
                 self.self_lr_scheduler,
                 self.lr_scheduler,
                 self.model, 
@@ -94,8 +102,53 @@ class DetSolver(BaseSolver):
                 ema=self.ema, 
                 scaler=self.scaler, 
                 lr_warmup_scheduler=self.lr_warmup_scheduler,
-                writer=self.writer
+                writer=self.writer,
+                teacher_model=self.teacher_model
             )
+
+            # GAM: Gradient-guided Adaptive Modulation
+            if dist_utils.is_main_process() and hasattr(self.criterion, 'distill_adaptive_params') and \
+                self.criterion.distill_adaptive_params and self.criterion.distill_adaptive_params.get('enabled', False):
+
+                params = self.criterion.distill_adaptive_params
+                default_weight = params.get('default_weight')
+
+                avg_percentage = sum(grad_percentages) / len(grad_percentages) if grad_percentages else 0.0
+
+                current_weight = self.criterion.weight_dict.get('loss_distill', 0.0)
+                new_weight = current_weight
+                reason = 'unchanged'
+
+                if avg_percentage < 1e-6:
+                    if default_weight is not None:
+                        new_weight = default_weight
+                        reason = 'reset_to_default_zero_grad'
+                elif epoch >= self.train_dataloader.collate_fn.stop_epoch:
+                    if default_weight is not None:
+                        new_weight = default_weight
+                        reason = 'ema_phase_default'
+                else:
+                    rho = params.get('rho', 0.5) 
+                    delta = params.get('delta', 0.1)
+                    lower_bound = rho - delta
+                    upper_bound = rho + delta
+                    if not (lower_bound <= avg_percentage <= upper_bound):
+                        target_percentage = upper_bound if avg_percentage < lower_bound else lower_bound
+                        if current_weight > 1e-6:
+                            p_current = avg_percentage / 100.0
+                            p_target = target_percentage / 100.0
+                            numerator = p_target * (1.0 - p_current)
+                            denominator = p_current * (1.0 - p_target)
+                            if abs(denominator) >= 1e-9:
+                                ratio = numerator / denominator
+                                ratio = max(ratio, 0.1)  # clamp non-positive to 0.1
+                                new_weight = current_weight * ratio
+                                new_weight = min(max(new_weight, current_weight / 10.0), current_weight * 10.0)
+                                reason = f'adjusted_to_{target_percentage:.2f}%'
+
+                if abs(new_weight - current_weight) > 0:
+                    self.criterion.weight_dict['loss_distill'] = new_weight
+                print(f"Epoch {epoch}: avg encoder grad {avg_percentage:.2f}% | distill {current_weight:.6f} -> {new_weight:.6f} ({reason})")
 
             if not self.self_lr_scheduler:  # update by epoch 
                 if self.lr_warmup_scheduler is None or self.lr_warmup_scheduler.finished():
@@ -199,3 +252,23 @@ class DetSolver(BaseSolver):
             dist_utils.save_on_master(coco_evaluator.coco_eval["bbox"].eval, self.output_dir / "eval.pth")
 
         return
+
+    def to(self, module, device):
+        return module.to(device) if hasattr(module, 'to') else module
+
+    def state_dict(self):
+        """State dict, train/eval"""
+        state = {}
+        state['date'] = datetime.datetime.now().isoformat()
+
+        # For resume
+        state['last_epoch'] = self.last_epoch
+
+        for k, v in self.__dict__.items():
+            if k == 'teacher_model':
+                continue
+            if hasattr(v, 'state_dict'):
+                v = dist_utils.de_parallel(v)
+                state[k] = v.state_dict()
+
+        return state

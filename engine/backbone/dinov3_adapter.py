@@ -16,6 +16,10 @@ import torch
 import torch.nn as nn
 import torch.nn.functional as F
 import torch.utils.checkpoint as cp
+try:
+    from safetensors.torch import load_file as load_safetensors
+except ImportError:
+    load_safetensors = None
 
 from functools import partial
 from ..core import register
@@ -85,18 +89,57 @@ class DINOv3STAs(nn.Module):
         hidden_dim=None,
     ):
         super(DINOv3STAs, self).__init__()
+
+        def load_checkpoint(model, path):
+            if path is None:
+                return False
+                
+            state_dict = None
+            if os.path.isdir(path):
+                # Check for safetensors first
+                safetensor_path = os.path.join(path, "model.safetensors")
+                if os.path.exists(safetensor_path):
+                    if load_safetensors is None:
+                        raise ImportError("safetensors library not found but model.safetensors detected.")
+                    print(f'Loading ckpt from directory (safetensors) {safetensor_path}...')
+                    state_dict = load_safetensors(safetensor_path)
+                else:
+                    # Fallback or other formats could be added here
+                    pass
+            elif os.path.isfile(path):
+                if path.endswith(".safetensors"):
+                    if load_safetensors is None:
+                        raise ImportError("safetensors library not found.")
+                    print(f'Loading ckpt from {path}...')
+                    state_dict = load_safetensors(path)
+                else:
+                    print(f'Loading ckpt from {path}...')
+                    state_dict = torch.load(path)
+            else:
+                 raise FileNotFoundError(f"Teacher weights not found at {path}")
+
+            if state_dict is not None:
+                if hasattr(model, '_model'):
+                     model._model.load_state_dict(state_dict, strict=False)
+                else:
+                     model.load_state_dict(state_dict, strict=False)
+                return True
+            return False
+
         if 'dinov3' in name:
             self.dinov3 = DinoVisionTransformer(name=name)
-            if weights_path is not None and os.path.exists(weights_path):
-                print(f'Loading ckpt from {weights_path}...')
-                self.dinov3.load_state_dict(torch.load(weights_path))
+            if weights_path is not None:
+                 if not load_checkpoint(self.dinov3, weights_path):
+                    print('Training DINOv3 from scratch...')
             else:
                 print('Training DINOv3 from scratch...')
         else:
             self.dinov3 =  VisionTransformer(embed_dim=embed_dim, num_heads=num_heads, return_layers=interaction_indexes)
-            if weights_path is not None and os.path.exists(weights_path):
-                print(f'Loading ckpt from {weights_path}...')
-                self.dinov3._model.load_state_dict(torch.load(weights_path))
+            if weights_path is not None:
+                if not load_checkpoint(self.dinov3, weights_path):
+                     print(f"Warning: Teacher weights initialization failed for {weights_path}, checking strictness...")
+                     # If explicit path given but failed, previously we raised error. 
+                     # load_checkpoint raises FileNotFoundError if path doesn't exist.
             else:
                 print('Training ViT-Tiny from scratch...')
 

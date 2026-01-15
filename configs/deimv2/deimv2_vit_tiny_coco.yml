@@ -1,0 +1,155 @@
+__include__: [
+  '../dataset/coco_detection.yml',
+  '../runtime.yml',
+  '../base/dataloader.yml',
+  '../base/optimizer.yml',
+  '../base/deimv2.yml',
+]
+
+output_dir: ./outputs/deimv2_vit_tiny_coco
+
+DEIM:
+  backbone: DINOv3STAs
+
+DINOv3STAs:
+  name: vit_tiny
+  embed_dim: 192
+  hidden_dim: 256
+  # weights_path: ./ckpts/vittplus_distill.pt # Use scratch if not available
+  interaction_indexes: [2, 5, 8, 11] # ViT-Tiny is 12 layers. Need to pick reasonable indices. 
+  # Usually standard is last layer. Or 4 layers. 
+  # dinov3_adapter logic: get_intermediate_layers(n=interaction_indexes)
+  # Adapter expects list of indices. 
+  # Adapter flattens and interpolates them. 
+  # If length is 1, it repeats. 
+  # Let's use [3, 7, 11] (indices 0-based) similar to sample config but adjusted for Tiny depth=12. 
+  # Sample used [3, 7, 11]. Standard ViT usually 12 layers. 
+  # Let's match standard ViT intermediate usage. 
+  interaction_indexes: [3, 7, 11] 
+  num_heads: 3
+
+HybridEncoder:
+  in_channels: [256, 256, 256]
+  depth_mult: 1
+  expansion: 0.67
+  hidden_dim: 256
+  dim_feedforward: 512
+  distill_teacher_dim: 384
+
+DEIMTransformer:
+  feat_channels: [256, 256, 256]
+  hidden_dim: 256
+  dim_feedforward: 512
+  num_layers: 4
+  eval_idx: -1
+
+optimizer:
+  type: AdamW
+  params: 
+    -
+      params: '^(?=.*.dinov3)(?!.*(?:norm|bn|bias)).*$'  
+      lr: 0.00025
+    -
+      params: '^(?=.*.dinov3)(?=.*(?:norm|bn|bias)).*$'    
+      lr: 0.00025
+      weight_decay: 0.
+    - 
+      params: '^(?=.*(?:sta|encoder|decoder))(?=.*(?:norm|bn|bias)).*$'
+      weight_decay: 0.
+
+  lr: 0.0005
+  betas: [0.9, 0.999]
+  weight_decay: 0.0001
+
+epoches: 72 # Standard DEIM schedule
+
+## LR-Scheduler
+flat_epoch: 29
+no_aug_epoch: 8
+
+## DataAug
+train_dataloader:
+  dataset: 
+    img_folder: /media/wxy/TiPro9000/COCO2017/train2017/
+    ann_file: /media/wxy/TiPro9000/COCO2017/annotations/instances_train2017.json
+    transforms:
+      ops:
+        - {type: Mosaic, output_size: 320, rotation_range: 10, translation_range: [0.1, 0.1], scaling_range: [0.5, 1.5],
+           probability: 1.0, fill_value: 0, use_cache: True, max_cached_images: 50, random_pop: True}
+        - {type: RandomPhotometricDistort, p: 0.5}
+        - {type: RandomZoomOut, fill: 0}
+        - {type: RandomIoUCrop, p: 0.8}
+        - {type: SanitizeBoundingBoxes, min_size: 1}
+        - {type: RandomHorizontalFlip}
+        - {type: Resize, size: [640, 640], }
+        - {type: SanitizeBoundingBoxes, min_size: 1}
+        - {type: ConvertPILImage, dtype: 'float32', scale: True}
+        - {type: Normalize, mean: [0.485, 0.456, 0.406], std: [0.229, 0.224, 0.225]}
+        - {type: ConvertBoxes, fmt: 'cxcywh', normalize: True}
+      policy:
+        epoch: [4, 29, 60]   # list 
+        ops: ['Mosaic', 'RandomPhotometricDistort', 'RandomZoomOut', 'RandomIoUCrop'] 
+
+  collate_fn:
+    mixup_prob: 0.5
+    ema_restart_decay: 0.9999
+    base_size_repeat: 6
+    mixup_epochs: [4, 29]
+    stop_epoch: 60
+    copyblend_epochs: [4, 60]
+
+  num_workers: 4
+  total_batch_size: 8 
+
+
+
+val_dataloader:
+  dataset: 
+    img_folder: /media/wxy/TiPro9000/COCO2017/val2017/
+    ann_file: /media/wxy/TiPro9000/COCO2017/annotations/instances_val2017.json
+    transforms:
+      ops: 
+        - {type: Resize, size: [640, 640]}
+        - {type: SanitizeBoundingBoxes, min_size: 1}
+        - {type: ConvertPILImage, dtype: 'float32', scale: True}
+        - {type: Normalize, mean: [0.485, 0.456, 0.406], std: [0.229, 0.224, 0.225]}
+        - {type: ConvertBoxes, fmt: 'cxcywh', normalize: True}
+  num_workers: 4
+  drop_last: False
+  collate_fn:
+    type: BatchImageCollateFunction
+
+  total_batch_size: 16
+
+
+teacher_model:
+  type: "DINOv3TeacherModel"
+  dinov3_repo_path: dinov3/
+  dinov3_weights_path: /media/wxy/TiPro9000/weights/dinov3_vittplus_distill.pt
+  dinov3_model_type: dinov3_vits16plus # Assuming this based on 'vittplus' and standard naming
+  patch_size: 16
+  mean: [0.485, 0.456, 0.406]
+  std: [0.229, 0.224, 0.225]
+
+DEIMCriterion:
+  weight_dict: {loss_mal: 1, loss_bbox: 5, loss_giou: 2, loss_fgl: 0.15, loss_ddf: 1.5, loss_distill: 5.0}
+  losses: ['mal', 'boxes', 'local', 'distill']
+  distill_adaptive_params:
+    enabled: True
+    rho: 11
+    delta: 1
+    default_weight: 20
+  distill_temp_schedule:
+    enabled: True
+    start_temp: 0.04  # sharper at start
+    end_temp: 0.1     # smoother at end
+    warmup_epochs: 20
+  matcher:
+    type: HungarianMatcher
+    weight_dict: {cost_class: 2, cost_bbox: 5, cost_giou: 2}
+    alpha: 0.25
+    gamma: 2.0
+    # change matcher as requested
+    change_matcher: True
+    iou_order_alpha: 4.0
+    matcher_change_epoch: 80

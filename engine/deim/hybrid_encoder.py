@@ -355,6 +355,7 @@ class HybridEncoder(nn.Module):
                  version='dfine',
                  csp_type='csp',
                  fuse_op='cat',
+                 distill_teacher_dim=0,
                  ):
         super().__init__()
         self.in_channels = in_channels
@@ -367,6 +368,18 @@ class HybridEncoder(nn.Module):
         self.out_channels = [hidden_dim for _ in range(len(in_channels))]
         self.out_strides = feat_strides
         self.fuse_op = fuse_op
+        self.distill_teacher_dim = distill_teacher_dim
+
+        assert len(use_encoder_idx) > 0, "use_encoder_idx must specify at least one encoder output"
+        # target AIFI output F5 for distillation
+        self.encoder_idx_for_distillation = use_encoder_idx[-1]
+
+        # feature_projector
+        self.feature_projector = None
+        if self.distill_teacher_dim > 0:
+            self.feature_projector = nn.Sequential(
+                    nn.Linear(hidden_dim, self.distill_teacher_dim),
+                )
 
         # channel projection
         self.input_proj = nn.ModuleList()
@@ -458,6 +471,7 @@ class HybridEncoder(nn.Module):
         proj_feats = [self.input_proj[i](feat) for i, feat in enumerate(feats)]
 
         # encoder
+        distill_student_output = None
         if self.num_encoder_layers > 0:
             for i, enc_ind in enumerate(self.use_encoder_idx):
                 h, w = proj_feats[enc_ind].shape[2:]
@@ -471,6 +485,14 @@ class HybridEncoder(nn.Module):
 
                 memory :torch.Tensor = self.encoder[i](src_flatten, pos_embed=pos_embed)
                 proj_feats[enc_ind] = memory.permute(0, 2, 1).reshape(-1, self.hidden_dim, h, w).contiguous()
+                
+                # Apply feature projector to F5
+                # Remove self.training check to allow Teacher model (in eval mode) to produce this output
+                if enc_ind == self.encoder_idx_for_distillation:
+                    if self.feature_projector is not None:
+                        distill_student_output = self.feature_projector(proj_feats[enc_ind].permute(0, 2, 3, 1)).permute(0, 3, 1, 2) # [B, distill_teacher_dim, H, W]
+                    else:
+                        distill_student_output = proj_feats[enc_ind]
 
         # broadcasting and fusion
         inner_outs = [proj_feats[-1]]
@@ -495,4 +517,6 @@ class HybridEncoder(nn.Module):
             out = self.pan_blocks[idx](fused_feat)
             outs.append(out)
 
+        if distill_student_output is not None:
+             return outs, distill_student_output
         return outs

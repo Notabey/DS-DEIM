@@ -39,6 +39,8 @@ class DEIMCriterion(nn.Module):
         share_matched_indices=False,
         mal_alpha=None,
         use_uni_set=True,
+        distill_adaptive_params=None,
+        distill_temp_schedule=None,
         ):
         """Create the criterion.
         Parameters:
@@ -64,6 +66,8 @@ class DEIMCriterion(nn.Module):
         self.num_pos, self.num_neg = None, None
         self.mal_alpha = mal_alpha
         self.use_uni_set = use_uni_set
+        self.distill_adaptive_params = distill_adaptive_params
+        self.distill_temp_schedule = distill_temp_schedule or {}
 
     def loss_labels_focal(self, outputs, targets, indices, num_boxes):
         assert 'pred_logits' in outputs
@@ -214,6 +218,64 @@ class DEIMCriterion(nn.Module):
 
         return losses
 
+    def loss_distillation(self, outputs, targets, indices, num_boxes, epoch=0, allow_missing=False):
+        student_feature_map = outputs.get('student_distill_output')
+        teacher_feature_map = outputs.get('teacher_encoder_output')
+        
+        if isinstance(teacher_feature_map, dict):
+            teacher_feature_map = teacher_feature_map.get('student_distill_output')
+
+        if student_feature_map is None or teacher_feature_map is None:
+            if self.training and not allow_missing:
+                raise RuntimeError("Distill loss requested but student_feature_map or teacher_feature_map is None! Check teacher model loading or distillation config. Ensure teacher model exports 'student_distill_output'.")
+            return {'loss_distill': torch.tensor(0.0,
+                                                 device=student_feature_map.device if student_feature_map is not None else torch.device(
+                                                     'cuda'), requires_grad=True)}
+
+        H_s, W_s = student_feature_map.shape[2:]
+        H_t, W_t = teacher_feature_map.shape[2:]
+
+        target_h, target_w = H_s, W_s
+
+        if (H_s, W_s) != (H_t, W_t):
+            teacher_feature_map = F.interpolate(teacher_feature_map,
+                                                size=(target_h, target_w),
+                                                mode='bilinear',
+                                                align_corners=False)
+
+        student_output_flat = student_feature_map.flatten(2).permute(0, 2, 1)
+        teacher_output_flat = teacher_feature_map.flatten(2).permute(0, 2, 1)
+
+        # Apply teacher temperature schedule
+        teacher_temp = self._get_teacher_temp(epoch)
+        if teacher_temp > 0:
+            # Temperature scaling: sharper distribution for lower temp
+            teacher_output_flat = teacher_output_flat / teacher_temp
+
+        student_output_norm = F.normalize(student_output_flat, p=2, dim=-1)
+        teacher_output_norm = F.normalize(teacher_output_flat, p=2, dim=-1)
+
+        cos_sim = F.cosine_similarity(student_output_norm, teacher_output_norm, dim=-1)
+        loss_distill = (1 - cos_sim).mean()
+
+        return {'loss_distill': loss_distill}
+
+    def _get_teacher_temp(self, epoch):
+        """Compute teacher temperature based on epoch schedule."""
+        if not self.distill_temp_schedule or not self.distill_temp_schedule.get('enabled', False):
+            return 0  # No temperature scaling
+        
+        start_temp = self.distill_temp_schedule.get('start_temp', 0.04)
+        end_temp = self.distill_temp_schedule.get('end_temp', 0.1)
+        warmup_epochs = self.distill_temp_schedule.get('warmup_epochs', 20)
+        
+        if epoch >= warmup_epochs:
+            return end_temp
+        
+        # Linear interpolation
+        progress = epoch / warmup_epochs
+        return start_temp + (end_temp - start_temp) * progress
+
     def _get_src_permutation_idx(self, indices):
         # permute predictions following indices
         batch_idx = torch.cat([torch.full_like(src, i) for i, (src, _) in enumerate(indices)])
@@ -259,9 +321,14 @@ class DEIMCriterion(nn.Module):
             'vfl': self.loss_labels_vfl,
             'mal': self.loss_labels_mal,
             'local': self.loss_local,
+            'distill': self.loss_distillation,
         }
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
         return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
+
+    def _get_distillation_weight_for_epoch(self) -> float:
+        fixed_weight = self.weight_dict.get('loss_distill', 0.0)
+        return fixed_weight
 
     def forward(self, outputs, targets, epoch=0, **kwargs):
         """ This performs the loss computation.
@@ -310,13 +377,20 @@ class DEIMCriterion(nn.Module):
         # Compute all the requested losses, main loss
         losses = {}
         for loss in self.losses:
-            use_uni_set = self.use_uni_set and (loss in ['boxes', 'local'])
-            indices_in = indices_go if use_uni_set else indices
-            num_boxes_in = num_boxes_go if use_uni_set else num_boxes
-            meta = self.get_loss_meta_info(loss, outputs, targets, indices_in)
-            l_dict = self.get_loss(loss, outputs, targets, indices_in, num_boxes_in, **meta)
-            l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
-            losses.update(l_dict)
+            if loss == 'distill':
+                l_dict = self.get_loss(loss, outputs, targets, indices, num_boxes, epoch=epoch)
+                if 'loss_distill' in l_dict and l_dict['loss_distill'] != 0:
+                    dynamic_weight = self._get_distillation_weight_for_epoch()
+                    l_dict['loss_distill'] = l_dict['loss_distill'] * dynamic_weight
+                losses.update(l_dict)
+            else:
+                use_uni_set = self.use_uni_set and (loss in ['boxes', 'local'])
+                indices_in = indices_go if use_uni_set else indices
+                num_boxes_in = num_boxes_go if use_uni_set else num_boxes
+                meta = self.get_loss_meta_info(loss, outputs, targets, indices_in)
+                l_dict = self.get_loss(loss, outputs, targets, indices_in, num_boxes_in, **meta)
+                l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
+                losses.update(l_dict)
 
         # In case of auxiliary losses, we repeat this process with the output of each intermediate layer.
         if 'aux_outputs' in outputs:
@@ -328,6 +402,8 @@ class DEIMCriterion(nn.Module):
                     indices_in = indices_go if use_uni_set else cached_indices[i]
                     num_boxes_in = num_boxes_go if use_uni_set else num_boxes
                     meta = self.get_loss_meta_info(loss, aux_outputs, targets, indices_in)
+                    if loss == 'distill':
+                        meta['allow_missing'] = True
                     l_dict = self.get_loss(loss, aux_outputs, targets, indices_in, num_boxes_in, **meta)
 
                     l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
@@ -342,6 +418,8 @@ class DEIMCriterion(nn.Module):
                 indices_in = indices_go if use_uni_set else cached_indices[-1]
                 num_boxes_in = num_boxes_go if use_uni_set else num_boxes
                 meta = self.get_loss_meta_info(loss, aux_outputs, targets, indices_in)
+                if loss == 'distill':
+                    meta['allow_missing'] = True
                 l_dict = self.get_loss(loss, aux_outputs, targets, indices_in, num_boxes_in, **meta)
 
                 l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
@@ -367,6 +445,8 @@ class DEIMCriterion(nn.Module):
                     indices_in = indices_go if use_uni_set else cached_indices_enc[i]
                     num_boxes_in = num_boxes_go if use_uni_set else num_boxes
                     meta = self.get_loss_meta_info(loss, aux_outputs, enc_targets, indices_in)
+                    if loss == 'distill':
+                        meta['allow_missing'] = True
                     l_dict = self.get_loss(loss, aux_outputs, enc_targets, indices_in, num_boxes_in, **meta)
                     l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
                     l_dict = {k + f'_enc_{i}': v for k, v in l_dict.items()}
@@ -387,6 +467,8 @@ class DEIMCriterion(nn.Module):
                     aux_outputs['up'], aux_outputs['reg_scale'] = outputs['up'], outputs['reg_scale']
                 for loss in self.losses:
                     meta = self.get_loss_meta_info(loss, aux_outputs, targets, indices_dn)
+                    if loss == 'distill':
+                        meta['allow_missing'] = True
                     l_dict = self.get_loss(loss, aux_outputs, targets, indices_dn, dn_num_boxes, **meta)
                     l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
                     l_dict = {k + f'_dn_{i}': v for k, v in l_dict.items()}
@@ -397,6 +479,8 @@ class DEIMCriterion(nn.Module):
                 aux_outputs = outputs['dn_pre_outputs']
                 for loss in self.losses:
                     meta = self.get_loss_meta_info(loss, aux_outputs, targets, indices_dn)
+                    if loss == 'distill':
+                        meta['allow_missing'] = True
                     l_dict = self.get_loss(loss, aux_outputs, targets, indices_dn, dn_num_boxes, **meta)
                     l_dict = {k: l_dict[k] * self.weight_dict[k] for k in l_dict if k in self.weight_dict}
                     l_dict = {k + '_dn_pre': v for k, v in l_dict.items()}

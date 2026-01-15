@@ -21,6 +21,27 @@ from ..data import CocoEvaluator
 from ..misc import MetricLogger, SmoothedValue, dist_utils
 
 
+
+def _compute_encoder_transformer_grad_percentage(model: torch.nn.Module) -> float:
+    """Compute percentage of gradients attributed to encoder transformer only.
+    This avoids collecting/printing any other stats for speed.
+    """
+    total_l1 = 0.0
+    enc_l1 = 0.0
+    for name, param in model.named_parameters():
+        grad = param.grad
+        if grad is None:
+            continue
+        val = grad.detach().abs().sum().item()
+        total_l1 += val
+        # Support both DDP ('module.') and non-DDP naming
+        if name.startswith('module.encoder.encoder') or name.startswith('encoder.encoder'):
+            enc_l1 += val
+    if total_l1 <= 0.0 or not math.isfinite(total_l1):
+        return 0.0
+    return 100.0 * enc_l1 / total_l1
+
+
 def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, criterion: torch.nn.Module,
                     data_loader: Iterable, optimizer: torch.optim.Optimizer,
                     device: torch.device, epoch: int, max_norm: float = 0, **kwargs):
@@ -37,7 +58,12 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
     scaler :GradScaler = kwargs.get('scaler', None)
     lr_warmup_scheduler :Warmup = kwargs.get('lr_warmup_scheduler', None)
 
+    teacher_model = kwargs.get('teacher_model', None)
+
     cur_iters = epoch * len(data_loader)
+    
+    # Gradient Analysis
+    encoder_grad_percentages = []
 
     for i, (samples, targets) in enumerate(metric_logger.log_every(data_loader, print_freq, header)):
         samples = samples.to(device)
@@ -45,9 +71,19 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
         global_step = epoch * len(data_loader) + i
         metas = dict(epoch=epoch, step=i, global_step=global_step, epoch_step=len(data_loader))
 
+        teacher_encoder_output_for_distillation = None
+        if teacher_model is not None:
+             with torch.no_grad():
+                out = teacher_model(samples)
+                if isinstance(out, dict):
+                    teacher_encoder_output_for_distillation = {k: v.detach() for k, v in out.items()}
+                else:
+                    teacher_encoder_output_for_distillation = out.detach()
+
         if scaler is not None:
             with torch.autocast(device_type=str(device), cache_enabled=True):
-                outputs = model(samples, targets=targets)
+                outputs = model(samples, targets=targets,
+                                teacher_encoder_output=teacher_encoder_output_for_distillation)
 
             if torch.isnan(outputs['pred_boxes']).any() or torch.isinf(outputs['pred_boxes']).any():
                 print(outputs['pred_boxes'])
@@ -75,8 +111,17 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
             scaler.update()
             optimizer.zero_grad()
 
+            # Collect gradient
+            if dist_utils.is_main_process() and hasattr(criterion, 'distill_adaptive_params') and \
+               getattr(criterion, 'distill_adaptive_params') and \
+               criterion.distill_adaptive_params.get('enabled', False):
+                pct = _compute_encoder_transformer_grad_percentage(model)
+                encoder_grad_percentages.append(pct)
+
+
         else:
-            outputs = model(samples, targets=targets)
+            outputs = model(samples, targets=targets,
+                            teacher_encoder_output=teacher_encoder_output_for_distillation)
             loss_dict = criterion(outputs, targets, **metas)
 
             loss : torch.Tensor = sum(loss_dict.values())
@@ -87,6 +132,14 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
 
             optimizer.step()
+
+             # Collect gradient
+            if dist_utils.is_main_process() and hasattr(criterion, 'distill_adaptive_params') and \
+               getattr(criterion, 'distill_adaptive_params') and \
+               criterion.distill_adaptive_params.get('enabled', False):
+                pct = _compute_encoder_transformer_grad_percentage(model)
+                encoder_grad_percentages.append(pct)
+
 
         # ema
         if ema is not None:
@@ -119,7 +172,7 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
     # gather the stats from all processes
     metric_logger.synchronize_between_processes()
     print("Averaged stats:", metric_logger)
-    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}
+    return {k: meter.global_avg for k, meter in metric_logger.meters.items()}, encoder_grad_percentages
 
 
 @torch.no_grad()

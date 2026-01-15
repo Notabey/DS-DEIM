@@ -23,12 +23,27 @@ class DEIM(nn.Module):
         self.decoder = decoder
         self.encoder = encoder
 
-    def forward(self, x, targets=None):
+    def forward(self, x, targets=None, teacher_encoder_output=None):
         x = self.backbone(x)
-        x = self.encoder(x)
-        x = self.decoder(x, targets)
+        
+        encoder_output = self.encoder(x)
+        
+        student_distill_output = None
+        student_distill_output = None
+        if isinstance(encoder_output, tuple) and len(encoder_output) == 2:
+            x_fpn_features, student_distill_output = encoder_output
+        else:
+            x_fpn_features = encoder_output
 
-        return x
+        x_decoder_out = self.decoder(x_fpn_features, targets)
+
+        if student_distill_output is not None:
+             x_decoder_out['student_distill_output'] = student_distill_output
+        
+        if teacher_encoder_output is not None:
+             x_decoder_out['teacher_encoder_output'] = teacher_encoder_output
+
+        return x_decoder_out
 
     def deploy(self, ):
         self.eval()

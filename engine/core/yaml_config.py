@@ -12,12 +12,14 @@ import re
 import copy
 
 from ._config import BaseConfig
-from .workspace import create
+from .workspace import create, GLOBAL_CONFIG
 from .yaml_utils import load_config, merge_config, merge_dict
 
 class YAMLConfig(BaseConfig):
     def __init__(self, cfg_path: str, **kwargs) -> None:
         super().__init__()
+
+        self._teacher_model = None # Initialize _teacher_model
 
         cfg = load_config(cfg_path)
         cfg = merge_dict(cfg, kwargs)
@@ -37,6 +39,32 @@ class YAMLConfig(BaseConfig):
         if self._model is None and 'model' in self.yaml_cfg:
             self._model = create(self.yaml_cfg['model'], self.global_cfg)
         return super().model
+
+    @property
+    def teacher_model(self, ) -> torch.nn.Module:
+        if self._teacher_model is None and 'teacher_model' in self.yaml_cfg:
+            teacher_cfg = copy.deepcopy(self.yaml_cfg['teacher_model'])
+            model_type = teacher_cfg.pop('type')
+
+            # Shallow copy GLOBAL_CONFIG to avoid modifying global state (pollution)
+            # and to avoid pickling modules (which deepcopy fails on)
+            # Handle mixed types (dicts and functions) in GLOBAL_CONFIG
+            temp_cfg = {}
+            for k, v in GLOBAL_CONFIG.items():
+                if isinstance(v, dict):
+                    temp_cfg[k] = v.copy()
+                else:
+                    temp_cfg[k] = v
+                    
+            if model_type not in temp_cfg:
+                raise ValueError(f"Teacher model type {model_type} is not registered in GLOBAL_CONFIG.")
+            
+            # Merge teacher config into the schema
+            temp_cfg[model_type].update(teacher_cfg)
+
+            self._teacher_model = create(model_type, temp_cfg)
+            
+        return self._teacher_model
 
     @property
     def postprocessor(self, ) -> torch.nn.Module:
