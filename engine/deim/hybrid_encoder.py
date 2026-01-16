@@ -486,9 +486,11 @@ class HybridEncoder(nn.Module):
                 memory :torch.Tensor = self.encoder[i](src_flatten, pos_embed=pos_embed)
                 proj_feats[enc_ind] = memory.permute(0, 2, 1).reshape(-1, self.hidden_dim, h, w).contiguous()
                 
-                # Apply feature projector to F5 (only during training)
-                if self.training and self.feature_projector is not None and enc_ind == self.encoder_idx_for_distillation:
-                    distill_student_output = self.feature_projector(proj_feats[enc_ind].permute(0, 2, 3, 1)).permute(0, 3, 1, 2) # [B, distill_teacher_dim, H, W]
+        # Apply feature projector to the target feature map (P4/P5) for distillation
+        # This happens regardless of whether AIFI (encoder) was applied or not
+        if self.training and self.feature_projector is not None:
+            enc_ind_distill = self.encoder_idx_for_distillation
+            distill_student_output = self.feature_projector(proj_feats[enc_ind_distill].permute(0, 2, 3, 1)).permute(0, 3, 1, 2)
 
         # broadcasting and fusion
         inner_outs = [proj_feats[-1]]

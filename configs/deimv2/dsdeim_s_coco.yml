@@ -20,13 +20,14 @@ DEIM:
 
 DSViT:
   embed_dims: [128, 192]
-  depths: [2, 10]
-  num_heads: 6
-  mlp_ratio: 3.
+  depths: [2, 12]  # Stage 2 matches ViT-Tiny depth (12 layers)
+  num_heads: 3    # Match ViT-Tiny (3 heads, 64 dim) for weight loading compatibility
+  mlp_ratio: 4.   # Match ViT-Tiny (Expansion 4) for weight loading compatibility
+  pretrained: ./ckpts/vitt_distill.pt
   drop_path_rate: 0.0     # Reverted to 0.0 as requested
 
 HybridEncoder:
-  in_channels: [128, 192, 192] 
+  in_channels: [128, 192, 192]  # P3=128(stage1), P4=192(stage2), P5=192(stage2_down) 
   depth_mult: 0.67
   expansion: 0.34
   hidden_dim: 192
@@ -34,6 +35,10 @@ HybridEncoder:
   # Logic: Student (192) projects TO Teacher (768). 
   # This param creates: Linear(192, 768).
   distill_teacher_dim: 768 
+  
+  # AIFI Configuration
+  num_encoder_layers: 0  # Disable AIFI (no transformer encoder)
+  use_encoder_idx: [1]   # Target P4 (idx=1) for distillation
 
 DEIMTransformer:
   feat_channels: [192, 192, 192]
@@ -68,16 +73,30 @@ DEIMCriterion:
     change_matcher: True
     iou_order_alpha: 4.0
     matcher_change_epoch: 100
+  
+  # Distill P4 (index 1) from Teacher [P3, P4, P5]
+  teacher_out_idx: 1
 
 optimizer:
   type: AdamW
   params: 
     -
-      # Backbone params excluding norm and bn (lower lr)
-      params: '^(?=.*backbone)(?!.*(?:norm|bn)).*$'
-      lr: 0.0002
+      # Group 1: Random Init Backbone Layers (Stem, Stage1, Transition, P3_fusion)
+      # Use higher LR to learn features from scratch
+      params: '^(?=.*backbone)(?=.*(?:stem|stage1|transition|p3_fusion))(?!.*(?:norm|bn)).*$'
+      lr: 0.0004
     -
-      # All norm and bn layers (no weight decay)
+      # Group 2: Pretrained Backbone Layers (Stage2)
+      # Use lower LR to preserve pretrained ViT-Tiny weights
+      params: '^(?=.*backbone)(?=.*stage2)(?!.*(?:norm|bn)).*$'
+      lr: 0.00005
+    -
+      # Other params (Neck, Head) - implicitly handled by default lr if not matched? 
+      # No, we need to be careful. The next group matches 'norm|bn'.
+      # Any param NOT matched by these regexes uses the global 'lr: 0.0004'.
+      # So simple backbone regex splitting is enough.
+      
+      # Group 3: All norm and bn layers (no weight decay)
       params: '^(?=.*(?:norm|bn)).*$'
       weight_decay: 0.
 
@@ -86,7 +105,7 @@ optimizer:
   weight_decay: 0.0001
 
 train_dataloader:
-  total_batch_size: 4 # Adjusted per user
+  total_batch_size: 32 # Adjusted per user
   dataset:
     transforms:
       ops:
@@ -130,3 +149,5 @@ teacher_model:
   dinov3_weights_path: /media/wxy/TiPro9000/weights/DINOv3_vitb16 
   dinov3_model_type: dinov3_vitb16
   patch_size: 16
+
+find_unused_parameters: False

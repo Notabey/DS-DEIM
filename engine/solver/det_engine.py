@@ -71,15 +71,17 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
         global_step = epoch * len(data_loader) + i
         metas = dict(epoch=epoch, step=i, global_step=global_step, epoch_step=len(data_loader))
 
-        teacher_encoder_output_for_distillation = None
-        if teacher_model is not None:
-             with torch.no_grad():
+        teacher_output_for_distill = None
+        # Only forward teacher during training (not eval) and when teacher exists
+        if teacher_model is not None and model.training:
+            # Use inference_mode for better performance than no_grad
+            with torch.inference_mode():
                 with torch.autocast(device_type=str(device), dtype=torch.bfloat16, enabled=True):
                     out = teacher_model(samples)
                     if isinstance(out, dict):
-                        teacher_encoder_output_for_distillation = {k: v.detach() for k, v in out.items()}
+                        teacher_encoder_output_for_distillation = {k: v.clone() for k, v in out.items()}
                     else:
-                        teacher_encoder_output_for_distillation = out.detach()
+                        teacher_encoder_output_for_distillation = out.clone()
 
         if scaler is not None:
             # Use bf16 autocast for forward pass

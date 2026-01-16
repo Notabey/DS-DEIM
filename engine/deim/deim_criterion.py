@@ -41,6 +41,7 @@ class DEIMCriterion(nn.Module):
         use_uni_set=True,
         distill_adaptive_params=None,
         distill_temp_schedule=None,
+        teacher_out_idx=1, # Default to P4 (index 1 of [P3, P4, P5])
         ):
         """Create the criterion.
         Parameters:
@@ -68,6 +69,7 @@ class DEIMCriterion(nn.Module):
         self.use_uni_set = use_uni_set
         self.distill_adaptive_params = distill_adaptive_params
         self.distill_temp_schedule = distill_temp_schedule or {}
+        self.teacher_out_idx = teacher_out_idx
 
     def loss_labels_focal(self, outputs, targets, indices, num_boxes):
         assert 'pred_logits' in outputs
@@ -223,7 +225,14 @@ class DEIMCriterion(nn.Module):
         teacher_feature_map = outputs.get('teacher_encoder_output')
         
         if isinstance(teacher_feature_map, dict):
-            teacher_feature_map = teacher_feature_map.get('student_distill_output')
+            # If teacher output is a dict, we expect 'features' list or similar
+            if 'features' in teacher_feature_map:
+                # Extract the specific feature map (e.g. P4)
+                teacher_feature_map = teacher_feature_map['features'][self.teacher_out_idx]
+            else:
+                # Check for legacy behavior or mismatched keys
+                # teacher_feature_map = teacher_feature_map.get('student_distill_output') 
+                pass
 
         if student_feature_map is None or teacher_feature_map is None:
             if self.training and not allow_missing:

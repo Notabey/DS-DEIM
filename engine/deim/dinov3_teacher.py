@@ -53,8 +53,8 @@ class DINOv3TeacherModel(nn.Module):
         # Get embed_dim from config
         self.teacher_feature_dim = self.model.config.hidden_size
         
-        self.normalize_transform = transforms.Normalize(mean=mean, std=std)
-        self.avgpool_2x2 = nn.AvgPool2d(kernel_size=2, stride=2)
+        self.normalize_transform = transforms.Normalize(mean=mean, std=std) # RT-DETRv4 does input downsampling.
+        # self.avgpool_2x2 = nn.AvgPool2d(kernel_size=2, stride=2)
 
         _logger.info(f"[Teacher Model] DINOv3 loaded. Feature dimension: {self.teacher_feature_dim}")
         _logger.info(f"[Teacher Model] Model config: hidden_size={self.model.config.hidden_size}, "
@@ -80,8 +80,8 @@ class DINOv3TeacherModel(nn.Module):
             Feature map [B, C, H_patches, W_patches]
         """
         # Input: [B, 3, H, W]
-        # Downsample 2x to match student's highest-level feature resolution
-        processed_images = self.avgpool_2x2(images)
+        # We process at full resolution to get 1/16 features (P4)
+        processed_images = images
 
         with torch.no_grad():
             # HuggingFace DINOv2/v3 output format

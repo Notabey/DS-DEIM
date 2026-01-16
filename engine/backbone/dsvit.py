@@ -10,7 +10,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 from timm.layers import DropPath, LayerScale, trunc_normal_
 
-from xformers.ops import SwiGLU
+
 import numpy as np
 from functools import partial
 from typing import Literal, Tuple
@@ -154,6 +154,19 @@ class Attention(nn.Module):
         x = self.proj_drop(x)
         return x
 
+class Mlp(nn.Module):
+    def __init__(self, in_features, hidden_features=None, out_features=None, act_layer=nn.GELU, drop=0.):
+        super().__init__()
+        out_features = out_features or in_features
+        hidden_features = hidden_features or in_features
+        self.fc1 = nn.Linear(in_features, hidden_features)
+        self.act = act_layer()
+        self.fc2 = nn.Linear(hidden_features, out_features)
+        self.drop = nn.Dropout(drop)
+    def forward(self, x):
+        x = self.fc1(x); x = self.act(x); x = self.drop(x); x = self.fc2(x); x = self.drop(x)
+        return x
+
 class Block(nn.Module):
     def __init__(self, dim, num_heads, mlp_ratio=4., qkv_bias=False, drop=0., attn_drop=0., drop_path=0., act_layer=nn.GELU, norm_layer=nn.LayerNorm):
         super().__init__()
@@ -161,7 +174,7 @@ class Block(nn.Module):
         self.attn = Attention(dim, num_heads=num_heads, qkv_bias=qkv_bias, attn_drop=attn_drop, proj_drop=drop)
         self.drop_path = DropPath(drop_path) if drop_path > 0. else nn.Identity()
         self.norm2 = norm_layer(dim)
-        self.mlp = SwiGLU(in_features=dim, hidden_features=int(dim * mlp_ratio))
+        self.mlp = Mlp(in_features=dim, hidden_features=int(dim * mlp_ratio), act_layer=act_layer, drop=drop)
 
     def forward(self, x, rope_sincos=None):
         attn_output = self.attn(self.norm1(x), rope_sincos=rope_sincos)
@@ -237,7 +250,8 @@ class DSViT(nn.Module):
                  mlp_ratio=3.,
                  drop_path_rate=0.1,
                  act_layer='gelu',
-                 out_indices=[0, 1] 
+                 out_indices=[0, 1],
+                 pretrained=None  # Add pretrained arg
                  ):
         super().__init__()
         
@@ -283,14 +297,72 @@ class DSViT(nn.Module):
             rescale_coords=None, dtype=None, device=None,
         )
 
-        self.p3_fusion = nn.Sequential(
-            nn.Conv2d(embed_dims[0] + embed_dims[1], embed_dims[0], 1, bias=False),
-            nn.BatchNorm2d(embed_dims[0]),
-            act_layer_func()
-        )
-        
+        # P3 fusion: concat MBConv(128) + ViT↑2x(192) → 192 channels
+        # Add learnable fusion for 1/8 resolution where local details matter most
         self.embed_dims = embed_dims 
         self.apply(self._init_weights)
+
+        if pretrained:
+            self.load_pretrained_weights(pretrained)
+
+    def load_pretrained_weights(self, pretrained_path):
+        import logging
+        logger = logging.getLogger(__name__)
+        
+        if not pretrained_path:
+            return
+
+        try:
+            logger.info(f"Loading pretrained weights from {pretrained_path}")
+            checkpoint = torch.load(pretrained_path, map_location='cpu')
+            state_dict = checkpoint
+            
+            # If state_dict is inside a key (e.g. 'model' or 'state_dict')
+            if 'model' in state_dict:
+                state_dict = state_dict['model']
+            if 'state_dict' in state_dict:
+                state_dict = state_dict['state_dict']
+
+            new_dict = {}
+            loaded_keys = []
+            
+            # Mapping rules:
+            # ViT Tiny checkpoint: blocks.X -> DSViT: stage2.X
+            # ViT Tiny checkpoint: rope_embed -> DSViT: rope_embed
+            
+            for k, v in state_dict.items():
+                if 'blocks.' in k:
+                    # Handle both 'blocks.' and '_model.blocks.' cases
+                    if '_model.blocks.' in k:
+                        new_key = k.replace('_model.blocks.', 'stage2.')
+                    elif k.startswith('blocks.'):
+                        new_key = k.replace('blocks.', 'stage2.')
+                    else:
+                        continue # Should not happen if 'blocks.' in k
+                    
+                    # We only load if shapes match. 
+                    new_dict[new_key] = v
+                    loaded_keys.append(new_key)
+                    
+                elif 'rope_embed.' in k:
+                     # Handle both 'rope_embed.' and '_model.rope_embed.'
+                    if '_model.rope_embed.' in k:
+                        new_key = k.replace('_model.rope_embed.', 'rope_embed.')
+                    else:
+                        new_key = k  # Assume it is already 'rope_embed.xxx'
+                        
+                    new_dict[new_key] = v
+                    loaded_keys.append(new_key)
+                    
+            # Load into model
+            if len(new_dict) == 0:
+                logger.warning(f"No keys matched! Checkpoint keys sample: {list(state_dict.keys())[:5]}")
+            else:
+                msg = self.load_state_dict(new_dict, strict=False)
+                logger.info(f"Pretrained weights loaded. Mapped {len(new_dict)} keys. Missing keys: {msg.missing_keys}")
+            
+        except Exception as e:
+            logger.warning(f"Failed to load pretrained weights: {e}")
 
     def _init_weights(self, m):
         if isinstance(m, nn.Conv2d):
@@ -332,9 +404,10 @@ class DSViT(nn.Module):
         
         # 5. Feature Pyramid
         p4 = feat_s2
-        p5 = F.max_pool2d(feat_s2, kernel_size=2, stride=2)
+        p5 = F.interpolate(feat_s2, scale_factor=0.5, mode='bilinear', align_corners=False)
         
-        p4_up = F.interpolate(p4, scale_factor=2.0, mode='bilinear', align_corners=False)
-        p3 = self.p3_fusion(torch.cat([feat_s1, p4_up], dim=1))
+        # P3: Direct output from Stage 1 (MBConv features, 128 ch)
+        # Detailed spatial features, will be fused with P4 in HybridEncoder
+        p3 = feat_s1
         
         return p3, p4, p5
