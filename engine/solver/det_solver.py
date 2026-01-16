@@ -28,6 +28,13 @@ class DetSolver(BaseSolver):
         self.teacher_model = self.to(teacher_model, self.device)
         if self.teacher_model is not None:
              self.teacher_model.eval()
+             # Disable torch.compile for teacher - multi-scale training causes infinite recompilations
+             # try:
+             #     self.teacher_model = torch.compile(self.teacher_model, mode='reduce-overhead')
+             #     print("Teacher model compiled with torch.compile!")
+             # except Exception as e:
+             #     print(f"Teacher model compile failed: {e}")
+             print("Teacher model loaded (torch.compile disabled for multi-scale compatibility)")
 
     def fit(self, ):
         self.train()

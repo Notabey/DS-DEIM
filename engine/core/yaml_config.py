@@ -168,7 +168,7 @@ class YAMLConfig(BaseConfig):
             visited.extend(list(params.keys()))
             # print(params.keys())
 
-        assert len(visited) == len(names), ''
+        assert len(visited) == len(names), f'Optimizer param mismatch: visited={len(visited)}, names={len(names)}'
 
         return param_groups
 

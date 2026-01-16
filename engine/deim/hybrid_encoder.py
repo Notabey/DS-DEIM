@@ -486,13 +486,9 @@ class HybridEncoder(nn.Module):
                 memory :torch.Tensor = self.encoder[i](src_flatten, pos_embed=pos_embed)
                 proj_feats[enc_ind] = memory.permute(0, 2, 1).reshape(-1, self.hidden_dim, h, w).contiguous()
                 
-                # Apply feature projector to F5
-                # Remove self.training check to allow Teacher model (in eval mode) to produce this output
-                if enc_ind == self.encoder_idx_for_distillation:
-                    if self.feature_projector is not None:
-                        distill_student_output = self.feature_projector(proj_feats[enc_ind].permute(0, 2, 3, 1)).permute(0, 3, 1, 2) # [B, distill_teacher_dim, H, W]
-                    else:
-                        distill_student_output = proj_feats[enc_ind]
+                # Apply feature projector to F5 (only during training)
+                if self.training and self.feature_projector is not None and enc_ind == self.encoder_idx_for_distillation:
+                    distill_student_output = self.feature_projector(proj_feats[enc_ind].permute(0, 2, 3, 1)).permute(0, 3, 1, 2) # [B, distill_teacher_dim, H, W]
 
         # broadcasting and fusion
         inner_outs = [proj_feats[-1]]
@@ -517,6 +513,6 @@ class HybridEncoder(nn.Module):
             out = self.pan_blocks[idx](fused_feat)
             outs.append(out)
 
-        if distill_student_output is not None:
-             return outs, distill_student_output
+        if self.training and distill_student_output is not None:
+            return outs, distill_student_output
         return outs

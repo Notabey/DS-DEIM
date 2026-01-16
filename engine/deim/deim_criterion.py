@@ -227,7 +227,7 @@ class DEIMCriterion(nn.Module):
 
         if student_feature_map is None or teacher_feature_map is None:
             if self.training and not allow_missing:
-                raise RuntimeError("Distill loss requested but student_feature_map or teacher_feature_map is None! Check teacher model loading or distillation config. Ensure teacher model exports 'student_distill_output'.")
+                raise RuntimeError("Distill loss requested but student_feature_map or teacher_feature_map is None!")
             return {'loss_distill': torch.tensor(0.0,
                                                  device=student_feature_map.device if student_feature_map is not None else torch.device(
                                                      'cuda'), requires_grad=True)}
@@ -246,12 +246,7 @@ class DEIMCriterion(nn.Module):
         student_output_flat = student_feature_map.flatten(2).permute(0, 2, 1)
         teacher_output_flat = teacher_feature_map.flatten(2).permute(0, 2, 1)
 
-        # Apply teacher temperature schedule
-        teacher_temp = self._get_teacher_temp(epoch)
-        if teacher_temp > 0:
-            # Temperature scaling: sharper distribution for lower temp
-            teacher_output_flat = teacher_output_flat / teacher_temp
-
+        # Cosine similarity distillation: compare L2-normalized feature vectors
         student_output_norm = F.normalize(student_output_flat, p=2, dim=-1)
         teacher_output_norm = F.normalize(teacher_output_flat, p=2, dim=-1)
 
@@ -326,9 +321,37 @@ class DEIMCriterion(nn.Module):
         assert loss in loss_map, f'do you really want to compute {loss} loss?'
         return loss_map[loss](outputs, targets, indices, num_boxes, **kwargs)
 
-    def _get_distillation_weight_for_epoch(self) -> float:
-        fixed_weight = self.weight_dict.get('loss_distill', 0.0)
-        return fixed_weight
+    def _get_distillation_weight_for_epoch(self, epoch: int = 0) -> float:
+        """
+        Compute distillation weight based on temperature schedule.
+        
+        Temperature increases from start_temp to end_temp over warmup_epochs.
+        Weight decreases proportionally: higher temp = lower weight.
+        This allows stricter distillation early and more freedom later.
+        
+        Example with default config (start=0.04, end=0.1, warmup=20):
+            Epoch 0:  temp=0.04, weight=5.0 (full weight)
+            Epoch 10: temp=0.07, weight=2.86
+            Epoch 20+: temp=0.1, weight=2.0
+        """
+        base_weight = self.weight_dict.get('loss_distill', 5.0)
+        
+        if not self.distill_temp_schedule or not self.distill_temp_schedule.get('enabled', False):
+            return base_weight  # No schedule, use fixed weight
+        
+        # Get temperature for current epoch
+        temp = self._get_teacher_temp(epoch)
+        start_temp = self.distill_temp_schedule.get('start_temp', 0.04)
+        
+        if temp <= 0 or start_temp <= 0:
+            return base_weight
+        
+        # Weight decay: inversely proportional to temperature ratio
+        # temp=start_temp -> weight=base_weight
+        # temp=end_temp -> weight=base_weight * (start_temp/end_temp)
+        weight = base_weight * (start_temp / temp)
+        
+        return weight
 
     def forward(self, outputs, targets, epoch=0, **kwargs):
         """ This performs the loss computation.
@@ -380,7 +403,7 @@ class DEIMCriterion(nn.Module):
             if loss == 'distill':
                 l_dict = self.get_loss(loss, outputs, targets, indices, num_boxes, epoch=epoch)
                 if 'loss_distill' in l_dict and l_dict['loss_distill'] != 0:
-                    dynamic_weight = self._get_distillation_weight_for_epoch()
+                    dynamic_weight = self._get_distillation_weight_for_epoch(epoch=epoch)
                     l_dict['loss_distill'] = l_dict['loss_distill'] * dynamic_weight
                 losses.update(l_dict)
             else:

@@ -74,14 +74,18 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
         teacher_encoder_output_for_distillation = None
         if teacher_model is not None:
              with torch.no_grad():
-                out = teacher_model(samples)
-                if isinstance(out, dict):
-                    teacher_encoder_output_for_distillation = {k: v.detach() for k, v in out.items()}
-                else:
-                    teacher_encoder_output_for_distillation = out.detach()
+                with torch.autocast(device_type=str(device), dtype=torch.bfloat16, enabled=True):
+                    out = teacher_model(samples)
+                    if isinstance(out, dict):
+                        teacher_encoder_output_for_distillation = {k: v.detach() for k, v in out.items()}
+                    else:
+                        teacher_encoder_output_for_distillation = out.detach()
 
         if scaler is not None:
-            with torch.autocast(device_type=str(device), cache_enabled=True):
+            # Use bf16 autocast for forward pass
+            # Note: bf16 has same dynamic range as fp32, so GradScaler is NOT needed
+            # We still use autocast for mixed precision, but skip scaler operations
+            with torch.autocast(device_type=str(device), dtype=torch.bfloat16, cache_enabled=True):
                 outputs = model(samples, targets=targets,
                                 teacher_encoder_output=teacher_encoder_output_for_distillation)
 
@@ -101,14 +105,14 @@ def train_one_epoch(self_lr_scheduler, lr_scheduler, model: torch.nn.Module, cri
                 loss_dict = criterion(outputs, targets, **metas)
 
             loss = sum(loss_dict.values())
-            scaler.scale(loss).backward()
+            
+            # BF16 doesn't need loss scaling - just do normal backward
+            loss.backward()
 
             if max_norm > 0:
-                scaler.unscale_(optimizer)
                 torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm)
 
-            scaler.step(optimizer)
-            scaler.update()
+            optimizer.step()
             optimizer.zero_grad()
 
             # Collect gradient

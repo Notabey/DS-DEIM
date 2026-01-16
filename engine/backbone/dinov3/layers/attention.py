@@ -103,6 +103,7 @@ class SelfAttention(nn.Module):
         x_flat = self.proj(x_flat)
         return uncat_with_shapes(x_flat, shapes, num_tokens)
 
+    @torch._dynamo.disable
     def compute_attention(self, qkv: Tensor, attn_bias=None, rope=None) -> Tensor:
         assert attn_bias is None
         B, N, _ = qkv.shape

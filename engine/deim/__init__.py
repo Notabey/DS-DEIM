@@ -21,3 +21,4 @@ from .rtdetrv2_decoder import RTDETRTransformerv2
 from .postprocessor import PostProcessor
 from .deim_criterion import DEIMCriterion
 from .deim_decoder import DEIMTransformer
+from .dinov3_teacher import DINOv3TeacherModel
